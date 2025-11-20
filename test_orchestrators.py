@@ -7,14 +7,25 @@ from datetime import datetime, timedelta, timezone
 import logging
 import os
 
-# Configuration
-ADMIN_TOKEN = '5dfc33056f17eef7f440f2b677abaf7a'
-API_URL = 'http://3.141.111.200:8081/api/orchestrators'
-# Use a persistent DB file next to this script so restarts don't reset it
-DB_FILE = os.path.join(os.path.dirname(__file__), 'orchestrators.db')
+# Optionally load variables from a .env file (requires python-dotenv)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-# Update interval (seconds) and DB state
-UPDATE_INTERVAL = 10  # seconds
+# Configuration (prefer environment variables)
+# Set these in your environment or in a .env file. Defaults retained for convenience.
+ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN', '')
+API_URL = os.environ.get('API_URL', 'http://3.141.111.200:8081/api/orchestrators')
+# Use a persistent DB file next to this script by default; override with DB_FILE env var
+DB_FILE = os.environ.get('DB_FILE', os.path.join(os.path.dirname(__file__), 'orchestrators.db'))
+
+# Update interval (seconds) and DB state (override with UPDATE_INTERVAL env var)
+try:
+    UPDATE_INTERVAL = int(os.environ.get('UPDATE_INTERVAL', '10'))  # seconds
+except Exception:
+    UPDATE_INTERVAL = 10
 db_initialized = False
 
 # Last update timestamp (timezone-aware ISO string)
