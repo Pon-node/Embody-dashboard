@@ -45,7 +45,7 @@ pip install flask requests
 
 ```ini
 # /opt/embody-dashboard/.env
-ADMIN_TOKEN=5dfc33056f17eef7f440f2b677abaf7a
+ADMIN_TOKEN=
 API_URL=http://3.141.111.200:8081/api/orchestrators
 # Other envs you may add: DB_FILE, UPDATE_INTERVAL
 ```
