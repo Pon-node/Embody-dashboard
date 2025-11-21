@@ -3,7 +3,7 @@ import requests
 import threading
 import time
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 
 # Configuration
@@ -38,37 +38,61 @@ def init_db():
     except Exception as e:
         print(f"Database init error: {e}")
 
-def get_balance_24h_ago(address):
-    """Get the balance from 24 hours ago"""
+def _normalize_timestamp(ts):
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.isoformat()
+    return str(ts)
+
+def get_balance_24h_ago(address, reference_time=None):
+    """Get the balance from 24 hours ago using the closest snapshot on or before the threshold.
+
+    If no snapshot exists at or before the threshold, fall back to the earliest snapshot after it.
+    """
     try:
+        if reference_time is None:
+            reference_time = datetime.now(timezone.utc)
+        elif reference_time.tzinfo is None:
+            reference_time = reference_time.replace(tzinfo=timezone.utc)
+
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        time_24h_ago = (datetime.utcnow() - timedelta(hours=24)).isoformat()
-        
+        time_24h_ago = (reference_time - timedelta(hours=24)).isoformat()
+
         cursor.execute('''
-            SELECT balance FROM balance_history 
+            SELECT balance FROM balance_history
             WHERE address = ? AND timestamp <= ?
             ORDER BY timestamp DESC LIMIT 1
         ''', (address, time_24h_ago))
         result = cursor.fetchone()
+
+        if not result:
+            cursor.execute('''
+                SELECT balance FROM balance_history
+                WHERE address = ? AND timestamp > ?
+                ORDER BY timestamp ASC LIMIT 1
+            ''', (address, time_24h_ago))
+            result = cursor.fetchone()
+
         conn.close()
         return result[0] if result else None
-    except:
+    except Exception:
         return None
 
-def save_balance(address, balance):
-    """Save balance snapshot with timestamp"""
+def save_balance(address, balance, timestamp=None):
+    """Save balance snapshot with timestamp."""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = _normalize_timestamp(timestamp or datetime.now(timezone.utc))
         cursor.execute('''
             INSERT INTO balance_history (address, balance, timestamp)
             VALUES (?, ?, ?)
         ''', (address, balance, timestamp))
         conn.commit()
         conn.close()
-    except Exception as e:
+    except Exception:
         pass
 
 def cleanup_old_records():
@@ -76,7 +100,7 @@ def cleanup_old_records():
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        time_25h_ago = (datetime.utcnow() - timedelta(hours=25)).isoformat()
+        time_25h_ago = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
         cursor.execute('DELETE FROM balance_history WHERE timestamp < ?', (time_25h_ago,))
         conn.commit()
         conn.close()
@@ -88,9 +112,11 @@ def format_timestamp(timestamp_str):
     if not timestamp_str:
         return 'N/A'
     try:
-        dt = datetime.fromisoformat(timestamp_str.replace('+00:00', ''))
-        return dt.strftime('%b %d, %Y %H:%M')
-    except:
+        dt = datetime.fromisoformat(timestamp_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime('%b %d, %Y %H:%M UTC')
+    except Exception:
         return timestamp_str
 
 def fetch_orchestrators():
