@@ -7,178 +7,241 @@ from datetime import datetime, timedelta, timezone
 import logging
 import os
 
-# Optionally load variables from a .env file (requires python-dotenv)
+# Optionally load variables from a .env file
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# Configuration (prefer environment variables)
-# Set these in your environment or in a .env file. Defaults retained for convenience.
-ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN', '')
-API_URL = os.environ.get('API_URL', 'http://3.141.111.200:8081/api/orchestrators')
-# Use a persistent DB file next to this script by default; override with DB_FILE env var
-DB_FILE = os.environ.get('DB_FILE', os.path.join(os.path.dirname(__file__), 'orchestrators.db'))
+# Configuration
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+API_URL = os.environ.get("API_URL", "http://3.141.111.200:8081/api/orchestrators")
 
-# Update interval (seconds) and DB state (override with UPDATE_INTERVAL env var)
+DB_FILE = os.environ.get(
+    "DB_FILE",
+    os.path.join(os.path.dirname(__file__), "orchestrators.db"),
+)
+
 try:
-    UPDATE_INTERVAL = int(os.environ.get('UPDATE_INTERVAL', '10'))  # seconds
+    UPDATE_INTERVAL = int(os.environ.get("UPDATE_INTERVAL", "10"))  # seconds
 except Exception:
-    UPDATE_INTERVAL = 10
-db_initialized = False
+    UPDATE_INTERVAL = 60
 
-# Last update timestamp (timezone-aware ISO string)
+db_initialized = False
 last_update = None
 
 app = Flask(__name__)
-
 orchestrators_data = []
 
+
 def init_db():
-    """Initialize the SQLite database"""
+    """Initialize the SQLite database."""
     global db_initialized
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        cursor.execute('''
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS balance_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 address TEXT NOT NULL,
                 balance REAL NOT NULL,
                 timestamp TEXT NOT NULL
             )
-        ''')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_address_timestamp ON balance_history(address, timestamp)')
-        # Improve concurrency
-        cursor.execute('PRAGMA journal_mode=WAL')
-        cursor.execute('PRAGMA synchronous=NORMAL')
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_address_timestamp "
+            "ON balance_history(address, timestamp)"
+        )
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
         conn.commit()
         conn.close()
         db_initialized = True
-        logging.info('Database initialized at %s', DB_FILE)
+        logging.info("Database initialized at %s", DB_FILE)
     except Exception:
-        logging.exception('Database init error')
+        logging.exception("Database init error")
+
 
 def get_balance_24h_ago(address):
-    """Get the balance from 24 hours ago"""
+    """Return the balance closest to 24 hours ago for a given address."""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        time_24h_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
 
-        cursor.execute('''
-            SELECT balance FROM balance_history 
+        target_time = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+        # Try snapshot at or before target_time
+        cursor.execute(
+            """
+            SELECT balance FROM balance_history
             WHERE address = ? AND timestamp <= ?
-            ORDER BY timestamp DESC LIMIT 1
-        ''', (address, time_24h_ago))
-        result = cursor.fetchone()
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (address, target_time),
+        )
+        row = cursor.fetchone()
+        if row:
+            conn.close()
+            return row[0]
+
+        # If no older snapshot, return oldest available snapshot
+        cursor.execute(
+            """
+            SELECT balance FROM balance_history
+            WHERE address = ?
+            ORDER BY timestamp ASC
+            LIMIT 1
+            """,
+            (address,),
+        )
+        row = cursor.fetchone()
         conn.close()
-        return result[0] if result else None
+        return row[0] if row else None
+
     except Exception:
-        logging.exception('Error fetching 24h-ago balance for %s', address)
+        logging.exception("Error fetching 24h-ago balance for %s", address)
         return None
 
+
 def save_balance(address, balance):
-    """Save balance snapshot with timestamp"""
+    """Save only one balance snapshot per address per hour."""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        timestamp = datetime.now(timezone.utc).isoformat()
-        cursor.execute('''
+
+        now = datetime.now(timezone.utc)
+        one_hour_ago = (now - timedelta(hours=1)).isoformat()
+
+        # Check if we already saved within the last hour for this address
+        cursor.execute(
+            """
+            SELECT 1 FROM balance_history
+            WHERE address = ? AND timestamp >= ?
+            LIMIT 1
+            """,
+            (address, one_hour_ago),
+        )
+        if cursor.fetchone():
+            conn.close()
+            return
+
+        cursor.execute(
+            """
             INSERT INTO balance_history (address, balance, timestamp)
             VALUES (?, ?, ?)
-        ''', (address, balance, timestamp))
+            """,
+            (address, balance, now.isoformat()),
+        )
         conn.commit()
         conn.close()
     except Exception:
-        logging.exception('Error saving balance for %s', address)
+        logging.exception("Error saving hourly balance for %s", address)
+
 
 def cleanup_old_records():
-    """Remove records older than 25 hours"""
+    """Remove records older than 25 hours."""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         time_25h_ago = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
-        cursor.execute('DELETE FROM balance_history WHERE timestamp < ?', (time_25h_ago,))
+        cursor.execute(
+            "DELETE FROM balance_history WHERE timestamp < ?",
+            (time_25h_ago,),
+        )
         conn.commit()
         conn.close()
     except Exception:
-        logging.exception('Error cleaning up old records')
+        logging.exception("Error cleaning up old records")
+
 
 def format_timestamp(timestamp_str):
-    """Format ISO timestamp to readable format"""
+    """Format ISO timestamp to a readable string."""
     if not timestamp_str:
-        return 'N/A'
+        return "N/A"
     try:
-        # Handle timezone-aware ISO strings
         dt = datetime.fromisoformat(timestamp_str)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).strftime('%b %d, %Y %H:%M UTC')
+        return dt.astimezone(timezone.utc).strftime("%b %d, %Y %H:%M UTC")
     except Exception:
         return timestamp_str
 
+
 def fetch_orchestrators():
-    global orchestrators_data
+    """Background loop that fetches orchestrator data and updates balances."""
+    global orchestrators_data, last_update
+
+    # Wait for DB initialization
     while not db_initialized:
         time.sleep(1)
-    
+
     while True:
         try:
-            headers = {
-                'X-Admin-Token': ADMIN_TOKEN
-            }
+            headers = {"X-Admin-Token": ADMIN_TOKEN}
             response = requests.get(API_URL, headers=headers, timeout=10)
-            
+
             if response.status_code == 200:
                 data = response.json()
-                if isinstance(data, dict) and 'orchestrators' in data:
-                    data = data['orchestrators']
-                elif isinstance(data, list):
-                    pass
-                else:
+                if isinstance(data, dict) and "orchestrators" in data:
+                    data = data["orchestrators"]
+                elif not isinstance(data, list):
                     data = []
-                
+
                 for o in data:
-                    addr = o.get('address', '')
-                    current_balance = float(o.get('balance_eth', 0))
-                    balance_24h_ago = get_balance_24h_ago(addr)
-                    
-                    if balance_24h_ago is None:
+                    addr = o.get("address", "")
+                    current_balance = float(o.get("balance_eth", 0.0))
+
+                    bal_24 = get_balance_24h_ago(addr)
+                    if bal_24 is None:
                         balance_change = 0.0
                     else:
-                        balance_change = current_balance - balance_24h_ago
-                    
-                    o['balance_change_24h'] = balance_change
+                        balance_change = current_balance - bal_24
+
+                    o["balance_change_24h"] = balance_change
+
+                    # Save hourly snapshot
                     save_balance(addr, current_balance)
-                    o['last_healthy_at_formatted'] = format_timestamp(o.get('last_healthy_at'))
-                
-                data.sort(key=lambda x: (
-                    x.get('last_healthy_at') is None,
-                    x.get('orchestrator_id', '').lower()
-                ))
-                
+
+                    # Pre-format health timestamp
+                    o["last_healthy_at_formatted"] = format_timestamp(
+                        o.get("last_healthy_at")
+                    )
+
+                # Sort orchestrators by health status then by ID
+                data.sort(
+                    key=lambda x: (
+                        x.get("last_healthy_at") is None,
+                        x.get("orchestrator_id", "").lower(),
+                    )
+                )
+
                 orchestrators_data = data
-                # update last update timestamp
-                global last_update
                 last_update = datetime.now(timezone.utc).isoformat()
-                logging.info('Fetched %d orchestrators (last_update=%s)', len(data), last_update)
+                logging.info(
+                    "Fetched %d orchestrators (last_update=%s)",
+                    len(data),
+                    last_update,
+                )
+
                 cleanup_old_records()
-                
-        except Exception as e:
-            logging.exception('Error fetching orchestrators')
-            
+
+        except Exception:
+            logging.exception("Error fetching orchestrators")
+
         time.sleep(UPDATE_INTERVAL)
 
-HTML_TEMPLATE = '''
+
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Orchestrators ETH Balances</title>
-<!-- Use a clean UI font 'Inter' for better readability -->
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
 <style>
 * {
@@ -206,10 +269,9 @@ body {
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 16px;
     padding: 30px;
-    margin: 0 auto 30px; /* center the header box within the container */
-    max-width: 1100px; /* keep header narrower than the container for a centered card look */
+    margin: 0 auto 30px;
+    max-width: 1100px;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-    /* center text horizontally and vertically without changing the card size */
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -236,8 +298,6 @@ body {
     margin-bottom: 30px;
 }
 
-/* Keep stats and table aligned with the header card width so the top card
-   matches the combined width of the three stat cards below */
 .stats, .table-container {
     max-width: 1100px;
     margin: 0 auto 30px;
@@ -247,8 +307,8 @@ body {
     background: rgba(255, 255, 255, 0.05);
     backdrop-filter: blur(10px);
     border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: calc(var(--card-radius) - 2px);
-    padding: var(--space-sm) var(--space);
+    border-radius: 14px;
+    padding: 10px 16px;
     box-shadow: 0 6px 26px rgba(0, 0, 0, 0.18);
     text-align: center;
 }
@@ -259,7 +319,7 @@ body {
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    margin-bottom: var(--space-xs);
+    margin-bottom: 4px;
 }
 
 .stat-card .value {
@@ -286,7 +346,7 @@ thead {
     background: rgba(255, 255, 255, 0.08);
 }
 
- th {
+th {
     padding: 14px 16px;
     text-align: left;
     font-weight: 600;
@@ -371,21 +431,20 @@ tbody tr:last-child td {
     .header h1 {
         font-size: 20px;
     }
-    
+
     table {
         font-size: 12px;
     }
-    
+
     th, td {
         padding: 10px 8px;
     }
-    
+
     .stat-card .value {
         font-size: 20px;
     }
 }
 
-/* Additional responsive rules for smaller devices */
 @media (max-width: 1024px) {
     .header {
         max-width: 95%;
@@ -396,7 +455,6 @@ tbody tr:last-child td {
 }
 
 @media (max-width: 768px) {
-    /* make stats stack as single column */
     .stats {
         grid-template-columns: 1fr;
         gap: 12px;
@@ -411,13 +469,11 @@ tbody tr:last-child td {
         font-size: 20px;
     }
 
-    /* allow horizontal scrolling for the table on small screens */
     .table-container {
         overflow-x: auto;
         -webkit-overflow-scrolling: touch;
     }
 
-    /* keep a minimum table width so columns remain readable */
     table {
         min-width: 720px;
     }
@@ -457,7 +513,7 @@ tbody tr:last-child td {
         <h1>Livepeer Orchestrators Monitor</h1>
         <div class="subtitle">Real-time ETH balance tracking with 24-hour change analysis</div>
     </div>
-    
+
     <div class="stats">
         <div class="stat-card">
             <div class="label">Total Orchestrators</div>
@@ -476,7 +532,7 @@ tbody tr:last-child td {
             <div class="value">{{ orchestrators|selectattr('is_top_100', 'equalto', true)|list|length }}</div>
         </div>
     </div>
-    
+
     <div class="table-container">
         <table>
             <thead>
@@ -526,28 +582,39 @@ tbody tr:last-child td {
 </div>
 </body>
 </html>
-'''
-@app.route('/')
+"""
+
+
+@app.route("/")
 def index():
-    # Prepare display fields safely
     for o in orchestrators_data:
         try:
-            o['balance_eth_fmt'] = f"{float(o.get('balance_eth', 0)):.8f}"
+            o["balance_eth_fmt"] = "{:.8f}".format(float(o.get("balance_eth", 0.0)))
         except Exception:
-            o['balance_eth_fmt'] = '0.00000000'
-        try:
-            o['balance_change_24h_fmt'] = f"{o.get('balance_change_24h', 0):+.8f}"
-        except Exception:
-            o['balance_change_24h_fmt'] = '+0.00000000'
-        o['last_healthy_at_formatted'] = format_timestamp(o.get('last_healthy_at'))
-    # Format last update for display
-    last_update_fmt = format_timestamp(last_update) if last_update else 'N/A'
-    return render_template_string(HTML_TEMPLATE, orchestrators=orchestrators_data, last_update=last_update_fmt)
+            o["balance_eth_fmt"] = "0.00000000"
 
-if __name__ == '__main__':
+        try:
+            o["balance_change_24h_fmt"] = "{:+.8f}".format(
+                o.get("balance_change_24h", 0.0)
+            )
+        except Exception:
+            o["balance_change_24h_fmt"] = "+0.00000000"
+
+        o["last_healthy_at_formatted"] = format_timestamp(o.get("last_healthy_at"))
+
+    last_update_fmt = format_timestamp(last_update) if last_update else "N/A"
+    return render_template_string(
+        HTML_TEMPLATE,
+        orchestrators=orchestrators_data,
+        last_update=last_update_fmt,
+    )
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     init_db()
     thread = threading.Thread(target=fetch_orchestrators)
     thread.daemon = True
     thread.start()
     time.sleep(2)
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host="0.0.0.0", port=5000)
